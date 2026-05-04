@@ -1,14 +1,10 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Parser)]
-#[command(
-    name = "gw",
-    about = "Bare-clone + worktree helper",
-    version
-)]
+#[command(name = "gw", about = "Bare-clone + worktree helper", version)]
 struct Cli {
     #[command(subcommand)]
     command: Cmd,
@@ -66,7 +62,11 @@ fn main() -> Result<()> {
     match cli.command {
         Cmd::Clone { url, path } => clone(&url, path.as_deref()),
         Cmd::Worktree { action } => match action {
-            WtAction::Add { name, base, existing } => wt_add(&name, base.as_deref(), existing),
+            WtAction::Add {
+                name,
+                base,
+                existing,
+            } => wt_add(&name, base.as_deref(), existing),
             WtAction::Remove { name, force } => wt_remove(&name, force),
             WtAction::List => wt_list(),
             WtAction::Prune { dry_run } => wt_prune(dry_run),
@@ -84,8 +84,7 @@ fn clone(url: &str, path: Option<&Path>) -> Result<()> {
         bail!("target directory already exists: {}", target.display());
     }
 
-    std::fs::create_dir_all(&target)
-        .with_context(|| format!("creating {}", target.display()))?;
+    std::fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
 
     let bare = target.join(".bare");
     let bare_str = path_str(&bare)?;
@@ -94,8 +93,10 @@ fn clone(url: &str, path: Option<&Path>) -> Result<()> {
     run(
         "git",
         &[
-            "--git-dir", bare_str,
-            "config", "remote.origin.fetch",
+            "--git-dir",
+            bare_str,
+            "config",
+            "remote.origin.fetch",
             "+refs/heads/*:refs/remotes/origin/*",
         ],
     )?;
@@ -106,8 +107,10 @@ fn clone(url: &str, path: Option<&Path>) -> Result<()> {
     run(
         "git",
         &[
-            "--git-dir", bare_str,
-            "worktree", "add",
+            "--git-dir",
+            bare_str,
+            "worktree",
+            "add",
             path_str(&worktree_path)?,
             &default_branch,
         ],
@@ -127,7 +130,10 @@ fn wt_add(name: &str, base: Option<&str>, existing: bool) -> Result<()> {
     let target_str = path_str(&target)?;
 
     if existing {
-        run("git", &["--git-dir", bare_str, "worktree", "add", target_str, name])?;
+        run(
+            "git",
+            &["--git-dir", bare_str, "worktree", "add", target_str, name],
+        )?;
     } else {
         let base_branch = match base {
             Some(b) => b.to_string(),
@@ -136,9 +142,12 @@ fn wt_add(name: &str, base: Option<&str>, existing: bool) -> Result<()> {
         run(
             "git",
             &[
-                "--git-dir", bare_str,
-                "worktree", "add",
-                "-b", name,
+                "--git-dir",
+                bare_str,
+                "worktree",
+                "add",
+                "-b",
+                name,
                 target_str,
                 &base_branch,
             ],
@@ -195,7 +204,8 @@ fn find_bare() -> Result<(PathBuf, PathBuf)> {
 
 fn default_branch(bare: &Path) -> Result<String> {
     let out = Command::new("git")
-        .arg("--git-dir").arg(bare)
+        .arg("--git-dir")
+        .arg(bare)
         .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
         .output()
         .context("running git symbolic-ref")?;
@@ -209,7 +219,8 @@ fn default_branch(bare: &Path) -> Result<String> {
 
     for candidate in ["main", "master", "trunk"] {
         let chk = Command::new("git")
-            .arg("--git-dir").arg(bare)
+            .arg("--git-dir")
+            .arg(bare)
             .args(["show-ref", "--verify", "--quiet"])
             .arg(format!("refs/heads/{candidate}"))
             .status()
@@ -225,7 +236,7 @@ fn default_branch(bare: &Path) -> Result<String> {
 fn repo_name_from_url(url: &str) -> Result<String> {
     let trimmed = url.trim_end_matches('/');
     let last = trimmed
-        .rsplit(|c| c == '/' || c == ':')
+        .rsplit(['/', ':'])
         .next()
         .filter(|s| !s.is_empty())
         .with_context(|| format!("could not parse repo name from URL: {url}"))?;
