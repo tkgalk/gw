@@ -46,6 +46,20 @@ gw clone git@github.com:org/repo.git
 # creates: repo/.bare/ and repo/<default-branch>/
 ```
 
+### Create a new repo
+
+```sh
+gw new myrepo
+# creates: myrepo/.bare/ and myrepo/main/ (an empty worktree, no commits yet)
+
+# Pick the initial branch name (defaults to git's init.defaultBranch, else "main")
+gw new myrepo --branch trunk
+```
+
+Like `git init`, this leaves you with an empty worktree and no commits — add a
+remote yourself once you have one (`git remote add origin <url>`). Requires
+git ≥ 2.42 (for `git worktree add --orphan`).
+
 ### Manage worktrees
 
 ```sh

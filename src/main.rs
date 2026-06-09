@@ -26,6 +26,14 @@ enum Cmd {
         /// Target directory (defaults to repo name in CWD)
         path: Option<PathBuf>,
     },
+    /// Create a new repo in the worktree-friendly layout (.bare + initial-branch worktree)
+    New {
+        /// Target directory (also the repo name)
+        path: PathBuf,
+        /// Initial branch name (defaults to git's init.defaultBranch, or "main")
+        #[arg(short, long)]
+        branch: Option<String>,
+    },
     /// Manage worktrees in the current bare-clone repo
     Worktree {
         #[command(subcommand)]
@@ -68,6 +76,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Cmd::Clone { url, path } => clone(&url, path.as_deref()),
+        Cmd::New { path, branch } => new_repo(&path, branch.as_deref()),
         Cmd::Worktree { action } => match action {
             WtAction::Add {
                 name,
@@ -87,36 +96,45 @@ fn clone(url: &str, path: Option<&Path>) -> Result<()> {
         None => PathBuf::from(repo_name_from_url(url)?),
     };
 
+    let default_branch = with_clean_target(&target, || clone_inner(url, &target))?;
+    print_layout(&target, &default_branch);
+    Ok(())
+}
+
+fn new_repo(target: &Path, branch: Option<&str>) -> Result<()> {
+    let default_branch = with_clean_target(target, || new_inner(target, branch))?;
+    print_layout(target, &default_branch);
+    Ok(())
+}
+
+/// Creates an empty `target` directory, runs `build` to populate it, and cleans
+/// up the whole directory if `build` fails or the process is interrupted.
+///
+/// From the moment we create it, `target` is ours: it didn't exist before
+/// (checked here) and `build` writes only inside it. If any step fails, remove
+/// the whole directory so we don't leave a half-initialized repo behind. Cleanup
+/// failures are reported but never mask the original error.
+///
+/// An interrupt handler is armed too: on Ctrl-C the terminal sends SIGINT to the
+/// whole foreground process group, so the child `git` dies on its own; the
+/// handler then removes the half-built directory and exits. Without it the
+/// default SIGINT disposition would kill us before any cleanup could run.
+fn with_clean_target<T>(target: &Path, build: impl FnOnce() -> Result<T>) -> Result<T> {
     if target.exists() {
         bail!("target directory already exists: {}", target.display());
     }
 
-    std::fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
+    std::fs::create_dir_all(target).with_context(|| format!("creating {}", target.display()))?;
 
-    // From here on `target` is ours: it didn't exist before (checked above) and
-    // every git step writes only inside it. If any step fails, remove the whole
-    // directory so we don't leave a half-initialized clone behind. Cleanup
-    // failures are reported but never mask the original error.
-    //
-    // Arm an interrupt handler too: on Ctrl-C the terminal sends SIGINT to the
-    // whole foreground process group, so the child `git` dies on its own; this
-    // handler then removes the half-built directory and exits. Without it the
-    // default SIGINT disposition would kill us before any cleanup could run.
     arm_interrupt_cleanup();
-    *CLEANUP_PATH.lock().unwrap() = Some(target.clone());
+    *CLEANUP_PATH.lock().unwrap() = Some(target.to_path_buf());
 
-    let result = clone_inner(url, &target);
-
-    match result {
-        Ok(default_branch) => {
+    match build() {
+        Ok(value) => {
             // Success: keep the directory, disarm cleanup first so a late Ctrl-C
-            // can't wipe the finished clone.
+            // can't wipe the finished repo.
             CLEANUP_PATH.lock().unwrap().take();
-            println!();
-            println!("{}/", target.display());
-            println!("  .bare/");
-            println!("  {}/", default_branch);
-            Ok(())
+            Ok(value)
         }
         Err(e) => {
             // `take()` races the signal handler; whoever wins removes the dir.
@@ -133,6 +151,13 @@ fn clone(url: &str, path: Option<&Path>) -> Result<()> {
             Err(e)
         }
     }
+}
+
+fn print_layout(target: &Path, default_branch: &str) {
+    println!();
+    println!("{}/", target.display());
+    println!("  .bare/");
+    println!("  {default_branch}/");
 }
 
 /// Install a Ctrl-C handler (once) that removes the in-progress clone directory
@@ -186,6 +211,54 @@ fn clone_inner(url: &str, target: &Path) -> Result<String> {
     )?;
 
     Ok(default_branch)
+}
+
+/// Initializes a bare repo in `target/.bare` and adds an empty worktree on a
+/// fresh (unborn) initial branch. Returns the initial branch name on success.
+fn new_inner(target: &Path, branch: Option<&str>) -> Result<String> {
+    let branch = match branch {
+        Some(b) => b.to_string(),
+        None => configured_default_branch(),
+    };
+    let bare = target.join(".bare");
+    let bare_str = path_str(&bare)?;
+    let worktree_path = target.join(&branch);
+
+    // `-b <branch>` records the initial branch as the bare repo's HEAD, which is
+    // how a remoteless repo tells `default_branch()` what to branch off later.
+    run("git", &["init", "--bare", "-b", &branch, bare_str])?;
+    run(
+        "git",
+        &[
+            "--git-dir",
+            bare_str,
+            "worktree",
+            "add",
+            "--orphan",
+            "-b",
+            &branch,
+            path_str(&worktree_path)?,
+        ],
+    )?;
+
+    Ok(branch)
+}
+
+/// The branch name `git init` would use: `init.defaultBranch` if configured,
+/// otherwise git's built-in default of "master" is overridden here to "main".
+fn configured_default_branch() -> String {
+    let out = Command::new("git")
+        .args(["config", "init.defaultBranch"])
+        .output();
+    if let Ok(out) = out
+        && out.status.success()
+    {
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    "main".to_string()
 }
 
 fn wt_add(name: &str, base: Option<&str>, existing: bool) -> Result<()> {
@@ -279,6 +352,31 @@ fn default_branch(bare: &Path) -> Result<String> {
         let s = String::from_utf8_lossy(&out.stdout);
         if let Some(rest) = s.trim().strip_prefix("refs/remotes/origin/") {
             return Ok(rest.to_string());
+        }
+    }
+
+    // No remote (e.g. a `gw new` repo): fall back to the bare repo's own HEAD,
+    // but only once the branch actually exists — an unborn branch has nothing to
+    // branch off, so let it fall through and fail below.
+    let head = Command::new("git")
+        .arg("--git-dir")
+        .arg(bare)
+        .args(["symbolic-ref", "HEAD"])
+        .output()
+        .context("running git symbolic-ref HEAD")?;
+    if head.status.success() {
+        let s = String::from_utf8_lossy(&head.stdout);
+        if let Some(rest) = s.trim().strip_prefix("refs/heads/") {
+            let exists = Command::new("git")
+                .arg("--git-dir")
+                .arg(bare)
+                .args(["show-ref", "--verify", "--quiet"])
+                .arg(format!("refs/heads/{rest}"))
+                .status()
+                .context("running git show-ref")?;
+            if exists.success() {
+                return Ok(rest.to_string());
+            }
         }
     }
 
