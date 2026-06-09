@@ -2,6 +2,13 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
+
+/// Directory that `gw clone` is currently populating. If set, it should be
+/// removed on interruption (Ctrl-C). Shared with the signal handler thread;
+/// `take()` gives mutual exclusion so the handler and the normal error path
+/// never both try to remove it.
+static CLEANUP_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[derive(Parser)]
 #[command(name = "gw", about = "Bare-clone + worktree helper", version)]
@@ -86,6 +93,68 @@ fn clone(url: &str, path: Option<&Path>) -> Result<()> {
 
     std::fs::create_dir_all(&target).with_context(|| format!("creating {}", target.display()))?;
 
+    // From here on `target` is ours: it didn't exist before (checked above) and
+    // every git step writes only inside it. If any step fails, remove the whole
+    // directory so we don't leave a half-initialized clone behind. Cleanup
+    // failures are reported but never mask the original error.
+    //
+    // Arm an interrupt handler too: on Ctrl-C the terminal sends SIGINT to the
+    // whole foreground process group, so the child `git` dies on its own; this
+    // handler then removes the half-built directory and exits. Without it the
+    // default SIGINT disposition would kill us before any cleanup could run.
+    arm_interrupt_cleanup();
+    *CLEANUP_PATH.lock().unwrap() = Some(target.clone());
+
+    let result = clone_inner(url, &target);
+
+    match result {
+        Ok(default_branch) => {
+            // Success: keep the directory, disarm cleanup first so a late Ctrl-C
+            // can't wipe the finished clone.
+            CLEANUP_PATH.lock().unwrap().take();
+            println!();
+            println!("{}/", target.display());
+            println!("  .bare/");
+            println!("  {}/", default_branch);
+            Ok(())
+        }
+        Err(e) => {
+            // `take()` races the signal handler; whoever wins removes the dir.
+            // If the handler already took it, it is removing + exiting, so we
+            // skip removal here.
+            if let Some(path) = CLEANUP_PATH.lock().unwrap().take()
+                && let Err(rm) = std::fs::remove_dir_all(&path)
+            {
+                eprintln!(
+                    "warning: failed to clean up {} after error: {rm}",
+                    path.display()
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Install a Ctrl-C handler (once) that removes the in-progress clone directory
+/// and exits. The handler runs on a dedicated thread (not in async-signal
+/// context), so `remove_dir_all` is safe to call here.
+fn arm_interrupt_cleanup() {
+    // `set_handler` errors if a handler is already installed; that's fine since
+    // we only need it set once per process.
+    let _ = ctrlc::set_handler(|| {
+        if let Ok(mut guard) = CLEANUP_PATH.lock()
+            && let Some(path) = guard.take()
+        {
+            let _ = std::fs::remove_dir_all(&path);
+            eprintln!("\ninterrupted; cleaned up {}", path.display());
+        }
+        std::process::exit(130);
+    });
+}
+
+/// Populates an already-created `target` directory with the bare clone and the
+/// default-branch worktree. Returns the default branch name on success.
+fn clone_inner(url: &str, target: &Path) -> Result<String> {
     let bare = target.join(".bare");
     let bare_str = path_str(&bare)?;
 
@@ -116,11 +185,7 @@ fn clone(url: &str, path: Option<&Path>) -> Result<()> {
         ],
     )?;
 
-    println!();
-    println!("{}/", target.display());
-    println!("  .bare/");
-    println!("  {}/", default_branch);
-    Ok(())
+    Ok(default_branch)
 }
 
 fn wt_add(name: &str, base: Option<&str>, existing: bool) -> Result<()> {
