@@ -38,12 +38,19 @@ jobs:
         env:
           CARGO: ${{ matrix.use_cross == true && 'cross' || 'cargo' }}
         run: $CARGO build --release --target ${{ matrix.target }}
-      - name: Stage binary
-        run: mv target/${{ matrix.target }}/release/gw gw-${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          STAGING="gw-${VERSION}-${{ matrix.target }}"
+          mkdir "$STAGING"
+          cp "target/${{ matrix.target }}/release/gw" README.md LICENSE.md "$STAGING/"
+          tar czf "$STAGING.tar.gz" "$STAGING"
+          echo "ASSET=$STAGING.tar.gz" >> "$GITHUB_ENV"
       - uses: actions/upload-artifact@v4
         with:
           name: gw-${{ matrix.target }}
-          path: gw-${{ matrix.target }}
+          path: ${{ env.ASSET }}
 
   release:
     needs: build
@@ -54,5 +61,5 @@ jobs:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
         with:
-          files: gw-*
+          files: gw-*.tar.gz
           generate_release_notes: true
